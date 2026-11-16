@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Bingo Familiar</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bowlby+One&family=Nunito:wght@400;600;800&display=swap">
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <style>
 /* Concepto: salon de bingo de noche. Fieltro verde, bolas de colores, cartones de papel.
    Una sola mirada (oscura) por decision del diseno. */
@@ -372,6 +373,134 @@ function miniFigura(key, pequena){
 }
 function nombreLimpio(s){ return String(s==null?'':s).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202f\u2060-\u206f\ufeff]/g,'').trim().slice(0,20); }
 
+/* ---------- Adaptador PeerJS (sala en vivo fuera de Claude) ----------
+   Misma interfaz que la capability "room": el anfitrion (pestaña Cantar) es el centro y
+   los jugadores se conectan a el con el nombre de la sala. Sin cuentas ni servidor propio. */
+function idPeerDeSala(nombre){
+  var limpio = String(nombre||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || 'familia';
+  return 'bingofam-' + limpio;
+}
+function crearSalaPeer(nombre, esHost){
+  return new Promise(function(resolve, reject){
+    var id = idPeerDeSala(nombre);
+    var handlers = {}, peerHs = [], connHs = [];
+    var conectadoP = false, cerrada = false, resuelto = false;
+    var myPres = {}, remote = {}, listaRemota = [], conns = {}, ultimo = {};
+    var peer = null, hubConn = null, retryT = null, bcT = null;
+
+    function fireP(){ peerHs.forEach(function(h){ try{ h({peers:api.peers()}); }catch(e){} }); }
+    function fireC(c){ if(conectadoP===c) return; conectadoP=c; connHs.forEach(function(h){ try{ h(c); }catch(e){} }); }
+    function entregar(topic, data){
+      (handlers[topic]||[]).forEach(function(h){
+        try{ h({ topic:topic, data:data, peer:'hub', by:null, isMe:false, sameTab:false, kind:'viewer', guest:false }); }catch(e){}
+      });
+    }
+    function terminar(ok, valor){ if(resuelto) return; resuelto=true; clearTimeout(tOut); if(ok) resolve(valor); else reject(valor); }
+    var tOut = setTimeout(function(){ terminar(false, {code:'upstream_error'}); try{ if(peer) peer.destroy(); }catch(e){} }, 12000);
+
+    var api = {
+      name: nombre, esHost: !!esHost,
+      emit: function(topic, data){
+        if(!esHost) return Promise.reject({code:'not_permitted'});
+        ultimo[topic]=data;
+        Object.keys(conns).forEach(function(k){ try{ conns[k].send({t:'emit', topic:topic, data:data}); }catch(e){} });
+        return Promise.resolve();
+      },
+      on: function(topic, h){
+        (handlers[topic]=handlers[topic]||[]).push(h);
+        return function(){ handlers[topic]=(handlers[topic]||[]).filter(function(x){ return x!==h; }); };
+      },
+      presence: function(patch){
+        Object.keys(patch).forEach(function(k){ if(patch[k]===null) delete myPres[k]; else myPres[k]=patch[k]; });
+        if(esHost) difundirPeers();
+        else if(hubConn && hubConn.open){ try{ hubConn.send({t:'pres', p:myPres}); }catch(e){} }
+        fireP();
+        return Promise.resolve();
+      },
+      peers: function(){
+        var yo = { peer: (peer && peer.id) || 'yo', isMe:true, sameTab:true, kind:'viewer', guest:false, by:null, presence:myPres, updatedAt:Date.now() };
+        var otros = [];
+        if(esHost){
+          Object.keys(conns).forEach(function(k){ otros.push({ peer:k, isMe:false, sameTab:false, kind:'viewer', guest:false, by:null, presence:remote[k]||{}, updatedAt:Date.now() }); });
+        }else{
+          listaRemota.forEach(function(it){
+            if(!it || typeof it.id!=='string' || it.id===(peer&&peer.id)) return;
+            otros.push({ peer:it.id, isMe:false, sameTab:false, kind:'viewer', guest:false, by:null, presence:(it.presence&&typeof it.presence==='object')?it.presence:{}, updatedAt:Date.now() });
+          });
+        }
+        return [yo].concat(otros);
+      },
+      onPeers: function(h){ peerHs.push(h); return function(){ peerHs=peerHs.filter(function(x){ return x!==h; }); }; },
+      connected: function(){ return conectadoP; },
+      onConnection: function(h){ connHs.push(h); setTimeout(function(){ try{ h(conectadoP); }catch(e){} },0); return function(){ connHs=connHs.filter(function(x){ return x!==h; }); }; },
+      leave: function(){
+        cerrada=true; clearTimeout(retryT); clearTimeout(bcT);
+        try{ if(peer) peer.destroy(); }catch(e){}
+        return Promise.resolve();
+      }
+    };
+
+    function difundirPeers(){
+      clearTimeout(bcT);
+      bcT = setTimeout(function(){
+        var lista=[{ id:'hub', presence:myPres }];
+        Object.keys(conns).forEach(function(k){ lista.push({ id:k, presence:remote[k]||{} }); });
+        Object.keys(conns).forEach(function(k){ try{ conns[k].send({t:'peers', list:lista}); }catch(e){} });
+        fireP();
+      }, 200);
+    }
+
+    try{
+      if(esHost){
+        peer = new Peer(id);
+        peer.on('open', function(){ fireC(true); terminar(true, api); });
+        peer.on('error', function(err){
+          if(err && err.type==='unavailable-id') terminar(false, {code:'hub_ocupado'});
+          else if(!resuelto) terminar(false, {code:'upstream_error'});
+        });
+        peer.on('disconnected', function(){ if(!cerrada){ try{ peer.reconnect(); }catch(e){} } });
+        peer.on('connection', function(c){
+          conns[c.peer]=c;
+          function salio(){ if(conns[c.peer]===c){ delete conns[c.peer]; delete remote[c.peer]; difundirPeers(); } }
+          c.on('open', function(){
+            Object.keys(ultimo).forEach(function(t){ try{ c.send({t:'emit', topic:t, data:ultimo[t]}); }catch(e){} });
+            difundirPeers();
+          });
+          c.on('data', function(m){
+            if(m && m.t==='pres' && m.p && typeof m.p==='object'){
+              try{ if(JSON.stringify(m.p).length>8000) return; }catch(e){ return; }
+              remote[c.peer]=m.p; difundirPeers();
+            }
+          });
+          c.on('close', salio); c.on('error', salio);
+        });
+      }else{
+        var conectar = function(){
+          if(cerrada || !peer || peer.destroyed) return;
+          var c = peer.connect(id, {reliable:true});
+          hubConn = c;
+          c.on('open', function(){ fireC(true); try{ c.send({t:'pres', p:myPres}); }catch(e){} });
+          c.on('data', function(m){
+            if(!m) return;
+            if(m.t==='emit' && typeof m.topic==='string') entregar(m.topic, m.data);
+            else if(m.t==='peers' && Array.isArray(m.list)){ listaRemota=m.list; fireP(); }
+          });
+          var cae = function(){ if(hubConn!==c) return; fireC(false); listaRemota=[]; fireP(); reintentar(); };
+          c.on('close', cae); c.on('error', cae);
+        };
+        var reintentar = function(){ if(cerrada) return; clearTimeout(retryT); retryT=setTimeout(conectar, 3000); };
+        peer = new Peer();
+        peer.on('open', function(){ terminar(true, api); conectar(); });
+        peer.on('error', function(err){
+          if(err && err.type==='peer-unavailable'){ fireC(false); reintentar(); }
+          else if(!resuelto) terminar(false, {code:'upstream_error'});
+        });
+        peer.on('disconnected', function(){ if(!cerrada){ try{ peer.reconnect(); }catch(e){} } });
+      }
+    }catch(e){ terminar(false, {code:'upstream_error'}); }
+  });
+}
+
 /* ---------- Sala en vivo (room) ---------- */
 var roomApi=null, room=null, offs=[], conectado=false, recibioEstado=false, miClaim=null, sinPermisoEmitir=false, estadoSala='sin';
 function codigoSala(s){ return String(s||'').toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9_.-]/g,'').replace(/^[^a-z0-9]+/,'').slice(0,40); }
@@ -381,7 +510,7 @@ function pintarEstado(){
   chip.classList.remove('live');
   if(!roomApi){ txt.textContent='Sin sala en vivo (modo manual)'; return; }
   if(!room){ txt.textContent = estadoSala==='uniendo' ? 'Entrando a la sala…' : 'Sin sala'; return; }
-  if(!conectado){ txt.textContent='Reconectando…'; return; }
+  if(!conectado){ txt.textContent = (roomApi && roomApi.esPeer && !room.esHost) ? 'Esperando al anfitrión…' : 'Conectando…'; return; }
   var n = jugadoresOtros().length;
   txt.textContent = 'En vivo · ' + n + (n===1?' jugador':' jugadores');
   chip.classList.add('live');
@@ -398,7 +527,9 @@ async function unirse(){
   conectado=false; recibioEstado=false; estadoSala='uniendo'; pintarEstado();
   try{
     room = await roomApi.join(codigo);
-  }catch(e){ room=null; estadoSala='error'; pintarEstado(); toast('No se pudo entrar a la sala'); renderTodo(); return; }
+  }catch(e){ room=null; estadoSala='error'; pintarEstado();
+    toast(e && e.code==='hub_ocupado' ? 'Ya hay un anfitrión en esta sala. Entra como jugador o usa otro nombre de sala.' : 'No se pudo entrar a la sala. Revisa tu internet.');
+    renderTodo(); return; }
   estadoSala='ok';
   offs.push(room.on('estado', alRecibirEstado, function(){}));
   offs.push(room.onPeers(function(){ pintarEstado(); renderJugadoresHost(); renderReclamos(); if(S.tab==='cantar') difundir(); }, function(){}));
@@ -571,135 +702,4 @@ function renderCantar(animar){
   var set=comoSet(ll);
   for(var r=0;r<5;r++){
     var tr=el('div','tr'); tr.appendChild(el('div','tl '+LET[r], LET[r]));
-    for(var n=RANGOS[r][0]; n<=RANGOS[r][1]; n++){
-      var c=el('div','cell '+LET[r]+(set[n]?' on':'')+(n===ultima?' last':''), String(n));
-      tr.appendChild(c);
-    }
-    tb.appendChild(tr);
-  }
-  renderJugadoresHost();
-  renderNotaSala();
-}
-function renderJugadoresHost(){
-  var cont=$('h-jugadores'); if(!cont) return; cont.textContent='';
-  if(S.tab!=='cantar') return;
-  var js=jugadoresOtros();
-  if(!room){ cont.appendChild(el('div','vacio','Sin sala en vivo. Canta las bolas en voz alta o muestra esta pantalla en la tele.')); return; }
-  if(!js.length){ cont.appendChild(el('div','vacio','Todavía no hay jugadores. Pídeles que abran el enlace en la sala "'+S.sala+'".')); return; }
-  var rs=reclamosActuales(S.host.g, S.host.llamados, S.host.p);
-  js.forEach(function(p){
-    var nombre=nombreLimpio(p.presence.nombre)||'Jugador';
-    var cs=Array.isArray(p.presence.cartones)?p.presence.cartones.length:0;
-    var mio=null; rs.forEach(function(r){ if(r.peer===p.peer) mio=r; });
-    var row=el('div','jug'+(mio?' claim':''));
-    row.appendChild(el('span','', nombre + (cs?'  ·  '+cs+(cs===1?' cartón':' cartones'):'')));
-    if(mio) row.appendChild(el('span','tag '+(mio.ok?'ok':'no'), mio.ok?'¡BINGO válido!':'Dice bingo, pero no completa'));
-    cont.appendChild(row);
-  });
-  rs.forEach(function(r){
-    var clave=r.peer+':'+r.n+':'+S.host.g;
-    if(r.ok && !avisados[clave]){ avisados[clave]=true; mostrarBanner(r.nombre); }
-  });
-}
-var avisados={};
-function renderNotaSala(){
-  var n=$('h-nota-sala'); if(!n) return;
-  if(!room) n.textContent='Sin sala en vivo: los números solo se ven en esta pantalla.';
-  else if(sinPermisoEmitir) n.textContent='Esta cuenta no puede transmitir en vivo. Solo el dueño del bingo o quien tenga permiso de edición puede cantar las bolas.';
-  else n.textContent='Los jugadores entran a la sala "'+S.sala+'" y ven cada bola al instante.';
-}
-function sacarBola(){
-  var H=S.host;
-  if(H.llamados.length>=75){ toast('Ya salieron las 75 bolas'); pararAuto(); return; }
-  var resto=[]; for(var n=1;n<=75;n++) if(H.llamados.indexOf(n)<0) resto.push(n);
-  var n2=resto[Math.floor(Math.random()*resto.length)];
-  H.llamados.push(n2); guardar(); hablar(n2); renderCantar(true); difundir();
-  if(H.llamados.length>=75) pararAuto();
-}
-function pararAuto(){ if(autoTimer){ clearInterval(autoTimer); autoTimer=null; } S.host.auto=false; guardar(); if($('chk-auto')) $('chk-auto').checked=false; }
-function ponerAuto(){
-  if(autoTimer){ clearInterval(autoTimer); autoTimer=null; }
-  if(S.host.auto){ autoTimer=setInterval(sacarBola, S.host.seg*1000); }
-}
-var confirmaNueva=null;
-function nuevaPartida(){
-  var b=$('btn-nueva');
-  if(!confirmaNueva){
-    b.textContent='¿Seguro? Toca otra vez para borrar las bolas';
-    confirmaNueva=setTimeout(function(){ confirmaNueva=null; b.textContent='Nueva partida'; }, 4000);
-    return;
-  }
-  clearTimeout(confirmaNueva); confirmaNueva=null; b.textContent='Nueva partida';
-  pararAuto();
-  S.host.g=nuevoId(); S.host.llamados=[]; guardar(); renderCantar(); difundir();
-  toast('Partida nueva lista');
-}
-
-/* ---------- Pestañas ---------- */
-function irA(tab){
-  S.tab=tab; guardar();
-  $('tab-jugar').setAttribute('aria-selected', tab==='jugar'?'true':'false');
-  $('tab-cantar').setAttribute('aria-selected', tab==='cantar'?'true':'false');
-  $('v-jugar').hidden = tab!=='jugar';
-  $('v-cantar').hidden = tab!=='cantar';
-  publicarPresencia();
-  if(tab==='cantar'){ renderCantar(); difundir(); } else { renderJugar(); renderReclamos(); }
-}
-function renderTodo(){ if(S.tab==='cantar') renderCantar(); else { renderJugar(); renderReclamos(); } pintarEstado(); }
-
-/* ---------- Eventos ---------- */
-function iniciar(){
-  cargar();
-  if(!S.cartones.length){ S.cartones=[nuevoCarton()]; S.marcas=[marcasVacias()]; }
-  var sel=$('sel-fig-manual'); ORDEN_FIG.forEach(function(k){ var o=el('option','',FIGURAS[k].nombre); o.value=k; sel.appendChild(o); });
-  $('inp-sala').value=S.sala; $('inp-nombre').value=S.nombre; $('chk-ayuda').checked=S.ayuda;
-
-  $('tab-jugar').addEventListener('click', function(){ irA('jugar'); });
-  $('tab-cantar').addEventListener('click', function(){ irA('cantar'); });
-  $('btn-sala').addEventListener('click', function(){ S.sala=$('inp-sala').value; unirse(); });
-  $('inp-sala').addEventListener('keydown', function(e){ if(e.key==='Enter'){ S.sala=$('inp-sala').value; unirse(); } });
-  $('inp-nombre').addEventListener('input', function(e){ S.nombre=nombreLimpio(e.target.value); guardar(); });
-  $('inp-nombre').addEventListener('change', function(){ publicarPresencia(); });
-  $('chk-ayuda').addEventListener('change', function(e){ S.ayuda=e.target.checked; guardar(); renderCartones(); });
-  $('btn-add').addEventListener('click', function(){
-    if(S.cartones.length>=MAX_CARTONES) return;
-    S.cartones.push(nuevoCarton()); S.marcas.push(marcasVacias()); guardar(); publicarPresencia(); renderCartones();
-  });
-  $('btn-manual').addEventListener('click', anotarManual);
-  $('inp-manual').addEventListener('keydown', function(e){ if(e.key==='Enter') anotarManual(); });
-  $('sel-fig-manual').addEventListener('change', function(e){ if(FIGURAS[e.target.value]){ S.jug.p=e.target.value; guardar(); renderJugar(); } });
-  $('btn-limpiar-manual').addEventListener('click', function(){ S.jug.llamados=[]; S.marcas=S.cartones.map(marcasVacias); miClaim=null; guardar(); publicarPresencia(); renderJugar(); });
-  $('banner-cerrar').addEventListener('click', function(){ $('banner').hidden=true; });
-
-  $('btn-sacar').addEventListener('click', sacarBola);
-  $('btn-deshacer').addEventListener('click', function(){ if(S.host.llamados.length){ S.host.llamados.pop(); guardar(); renderCantar(); difundir(); } });
-  $('chk-voz').addEventListener('change', function(e){ S.voz=e.target.checked; guardar(); });
-  $('chk-auto').addEventListener('change', function(e){ S.host.auto=e.target.checked; guardar(); ponerAuto(); });
-  $('sel-seg').addEventListener('change', function(e){ S.host.seg=+e.target.value; guardar(); ponerAuto(); });
-  $('btn-nueva').addEventListener('click', nuevaPartida);
-
-  S.host.auto=false; // al abrir la pagina el modo automatico siempre arranca apagado
-  irA(S.tab);
-  pintarEstado();
-
-  // Sala en vivo: se activa si la plataforma la ofrece; la pagina funciona sin ella
-  (async function(){
-    try{
-      if(window.claude && typeof window.claude.use==='function') roomApi = await window.claude.use('room');
-    }catch(e){ roomApi=null; }
-    pintarEstado();
-    if(roomApi) unirse(); else renderTodo();
-  })();
-}
-function anotarManual(){
-  var inp=$('inp-manual'), n=parseInt(inp.value,10);
-  if(!Number.isInteger(n)||n<1||n>75){ toast('Escribe un número entre 1 y 75'); return; }
-  if(S.jug.llamados.indexOf(n)>=0){ toast('Ese número ya estaba anotado'); inp.value=''; return; }
-  S.jug.llamados.push(n); inp.value=''; guardar(); renderJugar(true); inp.focus();
-}
-iniciar();
-})();
-</script>
-
-</body>
-</html>
+    for(var n=RANGO
